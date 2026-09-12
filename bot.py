@@ -14,6 +14,7 @@ from aiogram.types import (
     BufferedInputFile,
 )
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from groq import Groq
 
 from PIL import Image, ImageDraw, ImageFont
@@ -37,8 +38,11 @@ CHAT_MODELS = [
     "qwen/qwen3-32b",
 ]
 
-user_transcripts: dict[int, str] = {}
-MAX_FILE_SIZE = 49 * 1024 * 1024
+# user_id -> список распознанных кусков
+user_transcripts: dict[int, list[str]] = {}
+
+MAX_FILE_SIZE = 20 * 1024 * 1024   # жёсткий лимит Telegram Bot API
+MAX_PARTS_PER_LECTURE = 30         # защита от бесконечного добавления
 
 WELCOME_TEXT = (
     "🎓 Привет! Я бот-помощник для конспектов, которого создал Васька для тебя!\n\n"
@@ -46,7 +50,9 @@ WELCOME_TEXT = (
     "✅ Сделать хороший краткий конспект через нейросеть\n"
     "✅ Проверить свои знания через тест\n"
     "✅ Поднять настроение\n\n"
-    "📦 Максимальный размер файла: 49 МБ\n"
+    "💡 Можешь отправлять лекцию по частям — после каждого файла я предложу "
+    "добавить ещё или завершить.\n\n"
+    "📦 Максимум на один файл: 20 МБ\n"
     "🚀 Жду твой файл!"
 )
 
@@ -70,6 +76,13 @@ MOTIVATION_PHRASES = [
 def welcome_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✨ Поднять настроение", callback_data="motivate")]
+    ])
+
+
+def continue_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить ещё", callback_data="add_more")],
+        [InlineKeyboardButton(text="✅ Завершить", callback_data="finish")],
     ])
 
 
@@ -107,7 +120,6 @@ def ask_llm(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> s
 
 
 # ============ ОТРИСОВКА ТЕКСТА В КАРТИНКИ ============
-# Замены LaTeX-команд на Unicode
 LATEX_MAP = {
     r'\pi': 'π', r'\phi': 'φ', r'\varphi': 'φ', r'\alpha': 'α', r'\beta': 'β',
     r'\gamma': 'γ', r'\delta': 'δ', r'\epsilon': 'ε', r'\varepsilon': 'ε',
@@ -122,7 +134,6 @@ LATEX_MAP = {
 
 
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """Возвращает TTF-шрифт DejaVu из комплекта matplotlib (есть всегда)."""
     prop = font_manager.FontProperties(
         family='DejaVu Sans',
         weight='bold' if bold else 'normal',
@@ -143,45 +154,35 @@ def _clean_latex(s: str) -> str:
 
 
 def _parse_markdown_blocks(text: str):
-    """Возвращает список (стиль, содержимое).
-    Стили: 'h1', 'h2', 'h3', 'p', 'bullet', 'table', 'hr', 'blank'.
-    """
     blocks = []
     for raw in text.split('\n'):
-        line = raw.rstrip()
-        stripped = line.strip()
+        stripped = raw.strip()
         if not stripped:
             blocks.append(('blank', ''))
             continue
-        # Заголовки
         m = re.match(r'^(#{1,6})\s+(.*)$', stripped)
         if m:
             level = len(m.group(1))
             style = 'h1' if level == 1 else ('h2' if level == 2 else 'h3')
             blocks.append((style, m.group(2)))
             continue
-        # Горизонтальные линии
         if re.match(r'^[-*_]{3,}$', stripped):
             blocks.append(('hr', ''))
             continue
-        # Разделитель таблицы
         if re.match(r'^\|[\s\-:|]+\|$', stripped):
             blocks.append(('hr', ''))
             continue
-        # Строка таблицы
         if stripped.startswith('|') and stripped.endswith('|'):
             cells = [c.strip() for c in stripped.strip('|').split('|')]
             content = '  │  '.join(cells)
             content = re.sub(r'\*\*(.+?)\*\*', r'\1', content)
             blocks.append(('table', content))
             continue
-        # Список
         if re.match(r'^[-*+]\s+', stripped):
             content = re.sub(r'^[-*+]\s+', '', stripped)
             content = re.sub(r'\*\*(.+?)\*\*', r'\1', content)
             blocks.append(('bullet', content))
             continue
-        # Обычный абзац
         content = re.sub(r'\*\*(.+?)\*\*', r'\1', stripped)
         content = re.sub(r'__(.+?)__', r'\1', content)
         content = re.sub(r'\*(.+?)\*', r'\1', content)
@@ -198,7 +199,6 @@ def render_markdown_to_images(
     line_spacing: int = 10,
     max_image_height: int = 3500,
 ):
-    """Рендерит Markdown-текст в список PIL.Image (разбивает по высоте)."""
     blocks = _parse_markdown_blocks(text)
 
     font_p = _font(font_size)
@@ -218,7 +218,6 @@ def render_markdown_to_images(
     tmp_draw = ImageDraw.Draw(Image.new('RGB', (10, 10)))
     max_w = width - 2 * padding
 
-    # Собираем "строки для отрисовки": (font, text, height) | ('hr', '', h) | (None, '', h)
     wrapped = []
     for style, content in blocks:
         if style == 'blank':
@@ -241,7 +240,6 @@ def render_markdown_to_images(
             else:
                 if cur:
                     wrapped.append((font, cur, lh))
-                # Слишком длинное слово — жёсткий перенос
                 while tmp_draw.textlength(w, font=font) > max_w:
                     for i in range(len(w), 0, -1):
                         if tmp_draw.textlength(w[:i], font=font) <= max_w:
@@ -254,7 +252,6 @@ def render_markdown_to_images(
         if cur:
             wrapped.append((font, cur, lh))
 
-    # Разбиваем на страницы
     pages, current, current_h = [], [], 2 * padding
     for item in wrapped:
         _, _, lh = item
@@ -266,7 +263,6 @@ def render_markdown_to_images(
     if current:
         pages.append(current)
 
-    # Рисуем
     images = []
     for page_lines in pages:
         h = 2 * padding
@@ -296,10 +292,9 @@ def pil_to_png_bytes(img: Image.Image) -> bytes:
 
 
 async def send_as_images(target: Message, md_text: str, caption: str):
-    """Рендерит Markdown в картинки и отправляет их."""
     try:
         images = render_markdown_to_images(md_text)
-    except Exception as e:
+    except Exception:
         logging.exception("Ошибка рендера картинки, отправляю текстом")
         await target.answer(f"{caption}\n\n{md_text[:4000]}")
         return
@@ -319,6 +314,8 @@ async def send_as_images(target: Message, md_text: str, caption: str):
 # ============ СТАРТ ============
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    # Начинаем новую лекцию — сбрасываем буфер
+    user_transcripts[message.from_user.id] = []
     await message.answer(WELCOME_TEXT, reply_markup=welcome_kb())
 
 
@@ -332,16 +329,41 @@ async def cb_motivate(call: CallbackQuery):
 # ============ ПРИЁМ ГОЛОСОВОГО / АУДИО ============
 @dp.message(F.voice | F.audio)
 async def handle_audio(message: Message):
+    user_id = message.from_user.id
     media = message.voice or message.audio
 
     if media.file_size and media.file_size > MAX_FILE_SIZE:
-        await message.answer("❌ Файл больше 49 МБ. Отправь запись поменьше.")
+        await message.answer(
+            "❌ Файл больше 20 МБ — Telegram не отдаст его боту.\n"
+            "Разбей запись на части поменьше и отправь по очереди."
+        )
+        return
+
+    # Создаём буфер, если его нет
+    if user_id not in user_transcripts:
+        user_transcripts[user_id] = []
+
+    if len(user_transcripts[user_id]) >= MAX_PARTS_PER_LECTURE:
+        await message.answer(
+            f"⚠️ Достигнут лимит {MAX_PARTS_PER_LECTURE} файлов на одну лекцию.\n"
+            "Нажми /start чтобы начать заново."
+        )
         return
 
     status = await message.answer("⏳ Скачиваю запись...")
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    file = await bot.get_file(media.file_id)
+    # Скачиваем во временный файл
+    try:
+        file = await bot.get_file(media.file_id)
+    except TelegramBadRequest as e:
+        await status.edit_text(
+            "❌ Telegram не отдал файл боту.\n\n"
+            "Скорее всего запись больше 20 МБ. Разбей лекцию на части."
+        )
+        logging.warning(f"get_file failed: {e}")
+        return
+
     suffix = Path(file.file_path).suffix or ".ogg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
@@ -349,6 +371,7 @@ async def handle_audio(message: Message):
 
     await status.edit_text("🎧 Распознаю речь (может занять до минуты)...")
 
+    # Пробуем конвертировать через ffmpeg (если есть)
     mp3_path = tmp_path + ".mp3"
     converted = False
     try:
@@ -375,11 +398,7 @@ async def handle_audio(message: Message):
         text = (text or "").strip()
     except Exception as e:
         logging.exception("Ошибка распознавания")
-        await status.edit_text(
-            f"❌ Не удалось распознать запись.\n\n"
-            f"Проверь, что установлен ffmpeg и ключ Groq верный.\n\n"
-            f"Техническая ошибка: {e}"
-        )
+        await status.edit_text(f"❌ Не удалось распознать запись.\n\n{e}")
         for p in (tmp_path, mp3_path):
             try: os.unlink(p)
             except OSError: pass
@@ -393,23 +412,77 @@ async def handle_audio(message: Message):
         await status.edit_text("❌ Речь не распознана — возможно, запись слишком тихая.")
         return
 
+    user_transcripts[user_id].append(text)
+    parts_count = len(user_transcripts[user_id])
+    total_chars = sum(len(t) for t in user_transcripts[user_id])
+
     await status.delete()
-    user_transcripts[message.from_user.id] = text
 
-    await message.answer("📄 <b>Распознанный текст лекции:</b>", parse_mode="HTML")
-    for chunk in chunk_text(text):
-        await message.answer(chunk)
-
+    # Показываем превью распознанного фрагмента
+    preview = text[:300] + ("..." if len(text) > 300 else "")
     await message.answer(
+        f"✅ <b>Файл #{parts_count} добавлен</b>\n\n"
+        f"<i>Распознано символов: {len(text)}</i>\n\n"
+        f"📄 Фрагмент:\n{preview}",
+        parse_mode="HTML",
+    )
+    await message.answer(
+        f"📚 В лекции уже частей: <b>{parts_count}</b>\n"
+        f"📝 Всего символов: <b>{total_chars}</b>\n\n"
+        f"Что делаем дальше?",
+        parse_mode="HTML",
+        reply_markup=continue_kb(),
+    )
+
+
+# ============ КНОПКА "ДОБАВИТЬ ЕЩЁ" ============
+@dp.callback_query(F.data == "add_more")
+async def cb_add_more(call: CallbackQuery):
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(
+        "🎤 Отправляй следующий файл — я добавлю его к текущей лекции."
+    )
+    await call.answer()
+
+
+# ============ КНОПКА "ЗАВЕРШИТЬ" ============
+@dp.callback_query(F.data == "finish")
+async def cb_finish(call: CallbackQuery):
+    user_id = call.from_user.id
+    parts = user_transcripts.get(user_id) or []
+
+    if not parts:
+        await call.answer("Ты ещё не отправил ни одного файла 🎤", show_alert=True)
+        return
+
+    await call.message.edit_reply_markup(reply_markup=None)
+
+    full_text = "\n\n".join(parts).strip()
+
+    # Склеиваем и отправляем
+    await call.message.answer(
+        f"📄 <b>Распознанный текст лекции</b> "
+        f"(частей: {len(parts)}, символов: {len(full_text)}):",
+        parse_mode="HTML",
+    )
+    for chunk in chunk_text(full_text):
+        await call.message.answer(chunk)
+
+    # Меняем буфер: теперь храним единый склеенный текст
+    user_transcripts[user_id] = [full_text]
+
+    await call.message.answer(
         "✅ Готово! Что сделать с этой лекцией?",
         reply_markup=menu_kb(),
     )
+    await call.answer()
 
 
 # ============ КОНСПЕКТ ============
 @dp.callback_query(F.data == "summary")
 async def cb_summary(call: CallbackQuery):
-    text = user_transcripts.get(call.from_user.id)
+    parts = user_transcripts.get(call.from_user.id) or []
+    text = "\n\n".join(parts).strip()
     if not text:
         await call.answer("Сначала отправь запись лекции 🎤", show_alert=True)
         return
@@ -444,7 +517,8 @@ async def cb_summary(call: CallbackQuery):
 # ============ ТЕСТ ============
 @dp.callback_query(F.data == "quiz")
 async def cb_quiz(call: CallbackQuery):
-    text = user_transcripts.get(call.from_user.id)
+    parts = user_transcripts.get(call.from_user.id) or []
+    text = "\n\n".join(parts).strip()
     if not text:
         await call.answer("Сначала отправь запись лекции 🎤", show_alert=True)
         return
@@ -479,7 +553,8 @@ async def cb_quiz(call: CallbackQuery):
 @dp.message(F.text)
 async def fallback(message: Message):
     await message.answer(
-        "🎤 Отправь мне голосовое или аудио с лекцией — и я сделаю конспект и тест!",
+        "🎤 Отправь мне голосовое или аудио с лекцией — можно несколько файлов подряд.\n"
+        "После каждого я спрошу, добавить ещё или завершить.",
         reply_markup=welcome_kb(),
     )
 
