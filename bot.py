@@ -1,17 +1,20 @@
 import os
 import re
+import uuid
 import random
 import logging
 import tempfile
 import subprocess
+import asyncio
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BufferedInputFile,
+    BufferedInputFile, FSInputFile,
 )
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
@@ -20,9 +23,20 @@ from groq import Groq
 from PIL import Image, ImageDraw, ImageFont
 from matplotlib import font_manager
 
+# Планировщик и часовой пояс
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
+
 # ============ НАСТРОЙКИ ============
-BOT_TOKEN = "123"
-GROQ_API_KEY = "123"
+BOT_TOKEN = "18"
+GROQ_API_KEY = "g1"
+
+# Видео для напоминания (YouTube Shorts)
+REMINDER_VIDEO_URL = "https://youtube.com/shorts/1f6r4PWzJXk"
+REMINDER_TEXT = (
+    "🧹 Привет! Пора сделать чистку записей с телефона.\n\n"
+    "Инструкция в видео 💖"
+)
 # ===================================
 
 logging.basicConfig(level=logging.INFO)
@@ -38,12 +52,18 @@ CHAT_MODELS = [
     "qwen/qwen3-32b",
 ]
 
-# user_id -> список распознанных кусков
 user_transcripts: dict[int, list[str]] = {}
+user_history: dict[int, list[dict]] = {}
 
-MAX_FILE_SIZE = 20 * 1024 * 1024   # жёсткий лимит Telegram Bot API
-MAX_PARTS_PER_LECTURE = 30         # защита от бесконечного добавления
+# Все пользователи, которые хоть раз запускали бота — им шлём напоминания
+known_users: set[int] = set()
 
+MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_PARTS_PER_LECTURE = 30
+MAX_HISTORY_ITEMS = 20
+MAX_HISTORY_SHOWN = 15
+
+# ============ МОТИВАЦИЯ ============
 WELCOME_TEXT = (
     "🎓 Привет! Я бот-помощник для конспектов, которого создал Васька для тебя!\n\n"
     "📤 Отправь мне запись диктофона с лекции и я помогу тебе:\n\n"
@@ -57,26 +77,45 @@ WELCOME_TEXT = (
 )
 
 MOTIVATION_PHRASES = [
-    "Ты - босс. Ты - просто начальник нафик!",
-    "Сегодня ты либо победишь, либо научишься. Второе — тоже победа!",
-    "Не сдавайся, до дедлайна ещё есть время!",
-    "Ты умнее, чем думаешь, и сильнее, чем кажешься.",
-    "Каждая лекция — это шаг к твоей мечте. Вперёд!",
-    "Учёба — это марафон, а не спринт. Ты справишься!",
-    "Отдохни, но не сдавайся. Ты на правильном пути!",
-    "Ошибки — это не провал, а обратная связь от вселенной.",
-    "Твоя будущая версия уже гордится тобой!",
-    "Сделай это сейчас — потом скажешь себе спасибо!",
-    "Пока другие спят — ты становишься легендой.",
-    "Ты не устал. Ты просто на пути к успеху. Дыши и иди дальше!",
+    "Ты - босс🙈💖. Ты - просто начальник нафик! 💝✨",
+    "Сегодня ты либо победишь💪, либо научишься📚. Второе — тоже победа!🏆💖",
+    "Не сдавайся🥺💗, до дедлайна ещё есть время!⏳✨",
+    "Ты умнее🧠💫, чем думаешь, и сильнее💪🔥, чем кажешься.❤️",
+    "Каждая лекция📖 — это шаг к твоей мечте🌟💖. Вперёд!🚀💕",
+    "Учёба📚 — это марафон🏃‍♀️, а не спринт💨. Ты справишься!💪💖",
+    "Отдохни😴💗, но не сдавайся🥰. Ты на правильном пути!🛤️✨",
+    "Ошибки❌ — это не провал🙅‍♀️, а обратная связь от вселенной🌌💫💖",
+    "Твоя будущая версия👑 уже гордится тобой!💖🏆",
+    "Сделай это сейчас⚡💗 — потом скажешь себе спасибо!🙏💕",
+    "Пока другие спят😴💤 — ты становишься легендой🔥👑💖",
+    "Ты не устал🥺💗. Ты просто на пути к успеху🛣️✨. Дыши🌬️💖 и иди дальше!🚶‍♀️🌟",
 ]
 
 
+# ============ ХЕЛПЕРЫ ============
+def make_title(text: str, words: int = 7, max_len: int = 55) -> str:
+    cleaned = re.sub(r'\s+', ' ', text).strip()
+    if not cleaned:
+        return "Без названия"
+    parts = cleaned.split(' ')[:words]
+    title = " ".join(parts)
+    if len(title) > max_len:
+        title = title[:max_len].rstrip() + "…"
+    elif len(cleaned.split(' ')) > words:
+        title = title + "…"
+    return title
+
+
 # ============ КЛАВИАТУРЫ ============
-def welcome_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Поднять настроение", callback_data="motivate")]
-    ])
+def welcome_kb(has_history: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="✨ Поднять настроение", callback_data="motivate")],
+    ]
+    if has_history:
+        rows.append([
+            InlineKeyboardButton(text="📚 История конспектов", callback_data="history")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def continue_kb() -> InlineKeyboardMarkup:
@@ -90,7 +129,25 @@ def menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Сделать конспект", callback_data="summary")],
         [InlineKeyboardButton(text="🧠 Пройти тест", callback_data="quiz")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
     ])
+
+
+def history_kb(user_id: int) -> InlineKeyboardMarkup:
+    entries = user_history.get(user_id, [])[:MAX_HISTORY_SHOWN]
+    rows = []
+    for e in entries:
+        rows.append([
+            InlineKeyboardButton(text=e["title"], callback_data=f"hist:{e['id']}")
+        ])
+    if entries:
+        rows.append([
+            InlineKeyboardButton(text="🗑 Очистить историю", callback_data="history_clear")
+        ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def chunk_text(text: str, size: int = 4000):
@@ -311,18 +368,176 @@ async def send_as_images(target: Message, md_text: str, caption: str):
         await target.answer_photo(file, caption=cap)
 
 
+# ============ НАПОМИНАНИЕ ============
+def download_youtube_video(url: str, output_dir: str) -> str | None:
+    """Скачивает видео с YouTube Shorts через yt-dlp. Возвращает путь к файлу."""
+    out_tmpl = os.path.join(output_dir, "%(id)s.%(ext)s")
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "outtmpl": out_tmpl,
+            # Берём лучшее, что есть. Формат mp4 не обязателен —
+            # Telegram спокойно принимает webm/mkv/mp4.
+            "format": "bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",   # если есть ffmpeg — склеит в mp4
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            # На случай, если нужен обход "Sign in to confirm you're not a bot"
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web_safari"],
+                }
+            },
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+
+            # yt-dlp мог сохранить в другом расширении — ищем по id
+            if not os.path.exists(filepath):
+                vid = info.get("id")
+                for f in os.listdir(output_dir):
+                    if f.startswith(vid):
+                        filepath = os.path.join(output_dir, f)
+                        break
+
+            return filepath if os.path.exists(filepath) else None
+    except Exception as e:
+        logging.exception(f"Ошибка скачивания видео: {e}")
+        return None
+
+
+async def send_reminder():
+    """Раз в 2 недели в 19:00 МСК шлёт напоминание с видео."""
+    if not known_users:
+        logging.info("Напоминание: нет известных пользователей")
+        return
+
+    logging.info(f"Отправляю напоминание {len(known_users)} пользователям...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = download_youtube_video(REMINDER_VIDEO_URL, tmpdir)
+
+        if not video_path:
+            # Если видео не скачалось — шлём хотя бы текст + ссылку
+            logging.warning("Не удалось скачать видео для напоминания")
+            for uid in list(known_users):
+                try:
+                    await bot.send_message(
+                        uid,
+                        REMINDER_TEXT + f"\n\n🔗 {REMINDER_VIDEO_URL}",
+                    )
+                except Exception as e:
+                    logging.warning(f"Не отправлено пользователю {uid}: {e}")
+            return
+
+        video_file = FSInputFile(video_path, filename="cleanup.mp4")
+        size_mb = os.path.getsize(video_path) / 1024 / 1024
+        logging.info(f"Видео скачано: {size_mb:.1f} МБ")
+
+        for uid in list(known_users):
+            try:
+                await bot.send_video(
+                    chat_id=uid,
+                    video=video_file,
+                    caption=REMINDER_TEXT,
+                    supports_streaming=True,
+                )
+            except Exception as e:
+                logging.warning(f"Не отправлено пользователю {uid}: {e}")
+
+
 # ============ СТАРТ ============
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # Начинаем новую лекцию — сбрасываем буфер
-    user_transcripts[message.from_user.id] = []
-    await message.answer(WELCOME_TEXT, reply_markup=welcome_kb())
+    user_id = message.from_user.id
+    known_users.add(user_id)                 # запоминаем для напоминаний
+    user_transcripts[user_id] = []
+    has_history = bool(user_history.get(user_id))
+    await message.answer(WELCOME_TEXT, reply_markup=welcome_kb(has_history))
 
 
 # ============ ПОДНЯТЬ НАСТРОЕНИЕ ============
 @dp.callback_query(F.data == "motivate")
 async def cb_motivate(call: CallbackQuery):
+    known_users.add(call.from_user.id)
     await call.message.answer(random.choice(MOTIVATION_PHRASES))
+    await call.answer()
+
+
+# ============ ИСТОРИЯ ============
+@dp.callback_query(F.data == "history")
+async def cb_history(call: CallbackQuery):
+    entries = user_history.get(call.from_user.id, [])
+    if not entries:
+        await call.answer("История пуста", show_alert=True)
+        return
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    await call.message.answer(
+        "📚 <b>Твоя история конспектов:</b>\n"
+        "Выбери запись — можно сразу сделать по ней конспект или тест.",
+        parse_mode="HTML",
+        reply_markup=history_kb(call.from_user.id),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("hist:"))
+async def cb_history_pick(call: CallbackQuery):
+    hist_id = call.data.split(":", 1)[1]
+    entries = user_history.get(call.from_user.id, [])
+    entry = next((e for e in entries if e["id"] == hist_id), None)
+    if not entry:
+        await call.answer("Запись не найдена", show_alert=True)
+        return
+
+    user_transcripts[call.from_user.id] = [entry["text"]]
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    await call.message.answer(
+        f"📚 Загружена запись:\n<b>{entry['title']}</b>\n\n"
+        f"Что сделать с этой лекцией?",
+        parse_mode="HTML",
+        reply_markup=menu_kb(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "history_clear")
+async def cb_history_clear(call: CallbackQuery):
+    user_history[call.from_user.id] = []
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await call.message.answer(
+        "🗑 История очищена.",
+        reply_markup=welcome_kb(has_history=False),
+    )
+    await call.answer()
+
+
+# ============ НАЗАД В МЕНЮ ============
+@dp.callback_query(F.data == "back_to_menu")
+async def cb_back_to_menu(call: CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    has_history = bool(user_history.get(call.from_user.id))
+    await call.message.answer(WELCOME_TEXT, reply_markup=welcome_kb(has_history))
     await call.answer()
 
 
@@ -330,6 +545,7 @@ async def cb_motivate(call: CallbackQuery):
 @dp.message(F.voice | F.audio)
 async def handle_audio(message: Message):
     user_id = message.from_user.id
+    known_users.add(user_id)
     media = message.voice or message.audio
 
     if media.file_size and media.file_size > MAX_FILE_SIZE:
@@ -339,7 +555,6 @@ async def handle_audio(message: Message):
         )
         return
 
-    # Создаём буфер, если его нет
     if user_id not in user_transcripts:
         user_transcripts[user_id] = []
 
@@ -353,7 +568,6 @@ async def handle_audio(message: Message):
     status = await message.answer("⏳ Скачиваю запись...")
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    # Скачиваем во временный файл
     try:
         file = await bot.get_file(media.file_id)
     except TelegramBadRequest as e:
@@ -371,7 +585,6 @@ async def handle_audio(message: Message):
 
     await status.edit_text("🎧 Распознаю речь (может занять до минуты)...")
 
-    # Пробуем конвертировать через ffmpeg (если есть)
     mp3_path = tmp_path + ".mp3"
     converted = False
     try:
@@ -418,7 +631,6 @@ async def handle_audio(message: Message):
 
     await status.delete()
 
-    # Показываем превью распознанного фрагмента
     preview = text[:300] + ("..." if len(text) > 300 else "")
     await message.answer(
         f"✅ <b>Файл #{parts_count} добавлен</b>\n\n"
@@ -438,7 +650,10 @@ async def handle_audio(message: Message):
 # ============ КНОПКА "ДОБАВИТЬ ЕЩЁ" ============
 @dp.callback_query(F.data == "add_more")
 async def cb_add_more(call: CallbackQuery):
-    await call.message.edit_reply_markup(reply_markup=None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
     await call.message.answer(
         "🎤 Отправляй следующий файл — я добавлю его к текущей лекции."
     )
@@ -455,11 +670,24 @@ async def cb_finish(call: CallbackQuery):
         await call.answer("Ты ещё не отправил ни одного файла 🎤", show_alert=True)
         return
 
-    await call.message.edit_reply_markup(reply_markup=None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
 
     full_text = "\n\n".join(parts).strip()
 
-    # Склеиваем и отправляем
+    # Сохраняем в историю
+    title = make_title(full_text)
+    entry = {
+        "id": uuid.uuid4().hex[:8],
+        "title": title,
+        "text": full_text,
+    }
+    user_history.setdefault(user_id, [])
+    user_history[user_id].insert(0, entry)
+    user_history[user_id] = user_history[user_id][:MAX_HISTORY_ITEMS]
+
     await call.message.answer(
         f"📄 <b>Распознанный текст лекции</b> "
         f"(частей: {len(parts)}, символов: {len(full_text)}):",
@@ -468,11 +696,12 @@ async def cb_finish(call: CallbackQuery):
     for chunk in chunk_text(full_text):
         await call.message.answer(chunk)
 
-    # Меняем буфер: теперь храним единый склеенный текст
     user_transcripts[user_id] = [full_text]
 
     await call.message.answer(
-        "✅ Готово! Что сделать с этой лекцией?",
+        f"✅ Готово! Лекция сохранена в историю как:\n<b>{title}</b>\n\n"
+        f"Что сделать с этой лекцией?",
+        parse_mode="HTML",
         reply_markup=menu_kb(),
     )
     await call.answer()
@@ -487,7 +716,10 @@ async def cb_summary(call: CallbackQuery):
         await call.answer("Сначала отправь запись лекции 🎤", show_alert=True)
         return
 
-    await call.message.edit_reply_markup(reply_markup=None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
     msg = await call.message.answer("🧠 Нейросеть делает конспект...")
     await call.answer()
 
@@ -523,7 +755,10 @@ async def cb_quiz(call: CallbackQuery):
         await call.answer("Сначала отправь запись лекции 🎤", show_alert=True)
         return
 
-    await call.message.edit_reply_markup(reply_markup=None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
     msg = await call.message.answer("🧠 Нейросеть готовит тест...")
     await call.answer()
 
@@ -552,19 +787,104 @@ async def cb_quiz(call: CallbackQuery):
 # ============ ПРОЧИЕ СООБЩЕНИЯ ============
 @dp.message(F.text)
 async def fallback(message: Message):
+    known_users.add(message.from_user.id)
+    has_history = bool(user_history.get(message.from_user.id))
     await message.answer(
         "🎤 Отправь мне голосовое или аудио с лекцией — можно несколько файлов подряд.\n"
         "После каждого я спрошу, добавить ещё или завершить.",
-        reply_markup=welcome_kb(),
+        reply_markup=welcome_kb(has_history),
     )
 
+# ============ КОНСОЛЬНЫЙ СЛУШАТЕЛЬ ============
+async def console_listener():
+    """
+    Читает команды из консоли бота.
+    Доступно:
+      remind — принудительно отправить напоминание всем пользователям
+      help   — показать список команд
+      exit   — остановить бота
+    """
+    print("💬 Консольные команды: remind / help / exit")
+
+    loop = asyncio.get_running_loop()
+
+    while True:
+        try:
+            raw = await loop.run_in_executor(None, input)
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 Консоль закрыта.")
+            break
+
+        cmd = (raw or "").strip().lower()
+
+        if not cmd:
+            continue
+
+        if cmd == "remind":
+            print("📨 Отправляю напоминание вручную...")
+            # Запускаем в отдельной задаче, чтобы консоль не зависла
+            asyncio.create_task(_run_reminder_bg())
+        elif cmd == "help":
+            print("💬 Команды:")
+            print("   remind — отправить напоминание всем пользователям")
+            print("   help   — эта справка")
+            print("   exit   — остановить бота")
+        elif cmd in ("exit", "quit", "stop"):
+            print("🛑 Останавливаю бота...")
+            await dp.stop_polling()
+            break
+        else:
+            print(f"❓ Неизвестная команда: {cmd}. Введи 'help' для списка.")
+
+
+async def _run_reminder_bg():
+    """Обёртка для вызова send_reminder из консоли."""
+    try:
+        await send_reminder()
+        print("✅ Напоминание отправлено.")
+    except Exception as e:
+        logging.exception("Ошибка ручного напоминания")
+        print(f"❌ Ошибка: {e}")
 
 # ============ ЗАПУСК ============
 async def main():
-    print("✅ Бот запущен. Нажми Ctrl+C для остановки.")
-    await dp.start_polling(bot)
+    # Планировщик с московским часовым поясом
+    moscow_tz = pytz.timezone("Europe/Moscow")
+    scheduler = AsyncIOScheduler(timezone=moscow_tz)
+
+    # Каждые 2 недели в 19:00 МСК
+    scheduler.add_job(
+        send_reminder,
+        trigger="interval",
+        weeks=2,
+        next_run_time=datetime.now(moscow_tz).replace(
+            hour=19, minute=0, second=0, microsecond=0
+        ),
+        id="biweekly_cleanup_reminder",
+        replace_existing=True,
+        misfire_grace_time=3600,   # если опоздали < часа — всё равно выполнить
+        coalesce=True,             # не запускать несколько пропущенных подряд
+    )
+    scheduler.start()
+    logging.info("Планировщик запущен: напоминание раз в 2 недели в 19:00 МСК")
+
+    print("✅ Бот запущен.")
+    print("💬 Напиши 'remind' + Enter, чтобы отправить напоминание вручную.")
+    print("💬 'help' — справка, 'exit' — остановить.")
+    print("   (Ctrl+C тоже работает)")
+
+    # Запускаем консольный слушатель параллельно с polling
+    console_task = asyncio.create_task(console_listener())
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        console_task.cancel()
+        try:
+            await console_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
