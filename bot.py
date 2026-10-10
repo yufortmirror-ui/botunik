@@ -687,8 +687,14 @@ async def main():
     bot = Bot(token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global BOT, tclient
     BOT = bot
+    logging.info(
+        "Большие файлы: TELEGRAM_API_URL=%s | TELEGRAM_API_ID задан=%s | TELEGRAM_API_HASH задан=%s | telethon установлен=%s",
+        API_URL or "нет", bool(API_ID), bool(API_HASH), TelegramClient is not None,
+    )
     if not API_URL and API_ID and API_HASH:
         tclient = await start_mtproto(token)
+    elif not API_URL:
+        logging.warning("MTProto выключен: не заданы TELEGRAM_API_ID и/или TELEGRAM_API_HASH — лимит файлов 20 МБ")
     dp = Dispatcher()
     dp.message.outer_middleware(TouchMiddleware())
     dp.callback_query.outer_middleware(TouchMiddleware())
