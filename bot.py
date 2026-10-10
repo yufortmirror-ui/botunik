@@ -33,6 +33,10 @@ from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 load_dotenv()  # должен быть до импорта ai (там читается ключ)
+try:
+    from telethon import TelegramClient, events
+except ImportError:  # без telethon бот работает, но только с файлами до 20 МБ
+    TelegramClient = events = None
 import ai  # noqa: E402
 import db  # noqa: E402
 import schemes  # noqa: E402
@@ -46,7 +50,12 @@ LETTERS = "АБВГ"
 # Если задан адрес локального Bot API сервера — боту доступны файлы до 2 ГБ,
 # иначе обычный лимит Telegram на скачивание: 20 МБ.
 API_URL = os.getenv("TELEGRAM_API_URL", "").strip()
-MAX_FILE = (2000 if API_URL else 20) * 1024 * 1024
+API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
+API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+CLOUD_LIMIT = 20 * 1024 * 1024  # лимит обычного Bot API на скачивание
+MAX_FILE = 2000 * 1024 * 1024 if (API_URL or (API_ID and API_HASH)) else CLOUD_LIMIT
+BOT: "Bot | None" = None  # заполняется в main()
+tclient = None  # MTProto-клиент (Telethon) для файлов больше 20 МБ
 ADMIN_ID = int(os.getenv("ADMIN_ID", "787140952"))
 
 BTN_HISTORY = "📚 История лекций"
@@ -284,17 +293,28 @@ async def on_audio(m: Message, bot: Bot):
         await m.answer("Пришли аудиофайл с диктофона (.m4a) 🎧")
         return
     file_id, size, mime = info
-    if size and size > MAX_FILE:
-        limit = MAX_FILE // (1024 * 1024)
-        await m.answer(f"Файл больше {limit} МБ — боту такой не скачать. Раздели запись на части 🙏")
+    if size and size > CLOUD_LIMIT and tclient is not None:
+        return  # большой файл заберёт MTProto-обработчик (см. start_mtproto)
+    limit_bytes = MAX_FILE if (API_URL or tclient is not None) else CLOUD_LIMIT
+    if size and size > limit_bytes:
+        await m.answer(f"Файл больше {limit_bytes // (1024 * 1024)} МБ — боту такой не скачать. Раздели запись на части 🙏")
         return
 
-    chat_id = m.chat.id
+    async def fetch(path: str) -> None:
+        await bot.download(file_id, destination=path)
+
+    await process_audio(bot, m.chat.id, m.message_id, mime, size, fetch)
+
+
+async def process_audio(bot: Bot, chat_id: int, message_id: int, mime: str, size: int | None, fetch) -> None:
+    """Общий конвейер: скачать -> (сжать и нарезать) -> расшифровать -> добавить в набор.
+    fetch(path) — корутина, которая скачивает файл по указанному пути."""
     big = bool(size and size > 24 * 1024 * 1024)
-    status = await m.answer(
+    status = await bot.send_message(
+        chat_id,
         "🎧 Файл большой — разрежу на части и расшифрую, это займёт несколько минут…"
         if big
-        else "🎧 Слушаю запись, это займёт пару минут…"
+        else "🎧 Слушаю запись, это займёт пару минут…",
     )
 
     async def progress(i: int, n: int) -> None:
@@ -307,8 +327,8 @@ async def on_audio(m: Message, bot: Bot):
     processing[chat_id] = processing.get(chat_id, 0) + 1
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "input_audio")
-            await bot.download(file_id, destination=path)
+            path = str(Path(tmp) / "input_audio.m4a")  # тип определяет ffmpeg по содержимому
+            await fetch(path)
             transcript = await ai.transcribe_path(path, mime, progress)
     except Exception:
         logging.exception("transcribe failed")
@@ -320,7 +340,7 @@ async def on_audio(m: Message, bot: Bot):
         await status.edit_text("🤔 Речи в этом аудио почти не нашлось. Проверь файл.")
         return
 
-    n = db.add_draft(chat_id, m.message_id, transcript)
+    n = db.add_draft(chat_id, message_id, transcript)
     preview = transcript[:250] + ("…" if len(transcript) > 250 else "")
     await status.edit_text(
         f"✅ <b>Аудио обработано</b> (в наборе: {n})\n\n<i>{html.escape(preview)}</i>\n\n"
@@ -335,6 +355,48 @@ async def on_audio(m: Message, bot: Bot):
         except TelegramBadRequest:
             pass
     draft_ctrl[chat_id] = status.message_id
+
+
+async def start_mtproto(token: str):
+    """Второе подключение бота — по MTProto (Telethon). Оно умеет скачивать файлы до 2 ГБ,
+    в отличие от обычного Bot API (20 МБ). Нужны TELEGRAM_API_ID и TELEGRAM_API_HASH."""
+    if TelegramClient is None:
+        logging.warning("telethon не установлен: pip install telethon — иначе файлы больше 20 МБ недоступны")
+        return None
+    try:
+        client = TelegramClient(
+            str(Path(db.DB_PATH).resolve().parent / "mtproto_session"), int(API_ID), API_HASH
+        )
+        await client.start(bot_token=token)
+    except Exception:
+        logging.exception("MTProto не запустился, продолжаю только с файлами до 20 МБ")
+        return None
+
+    async def on_big(event) -> None:
+        f = event.file
+        ext = os.path.splitext((f.name or "").lower())[1]
+        mime = AUDIO_EXT.get(ext) or (f.mime_type if (f.mime_type or "").startswith("audio/") else None)
+        if not mime:
+            return  # не аудио — ответит обычный обработчик
+        db.touch(event.chat_id)
+        if f.size > MAX_FILE:
+            await BOT.send_message(event.chat_id, "Файл больше 2 ГБ — боту такой не скачать. Раздели запись на части 🙏")
+            return
+
+        async def fetch(path: str) -> None:
+            await client.download_media(event.message, file=path)
+
+        await process_audio(BOT, event.chat_id, event.id, mime, f.size, fetch)
+
+    client.add_event_handler(
+        on_big,
+        events.NewMessage(
+            incoming=True,
+            func=lambda e: e.is_private and e.file is not None and (e.file.size or 0) > CLOUD_LIMIT,
+        ),
+    )
+    logging.info("MTProto включён: файлы до 2 ГБ")
+    return client
 
 
 @router.callback_query(F.data.startswith("draft:"))
@@ -623,6 +685,10 @@ async def main():
         session = AiohttpSession(api=TelegramAPIServer.from_base(API_URL, is_local=True), timeout=600)
         logging.info("Работаю через локальный Bot API: %s (файлы до 2 ГБ)", API_URL)
     bot = Bot(token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global BOT, tclient
+    BOT = bot
+    if not API_URL and API_ID and API_HASH:
+        tclient = await start_mtproto(token)
     dp = Dispatcher()
     dp.message.outer_middleware(TouchMiddleware())
     dp.callback_query.outer_middleware(TouchMiddleware())
@@ -635,7 +701,11 @@ async def main():
     sch.add_job(job_expire_daily, "interval", minutes=1, args=[bot])
     sch.start()
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if tclient is not None:
+            await tclient.disconnect()
 
 
 if __name__ == "__main__":
